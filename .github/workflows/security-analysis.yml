@@ -1,0 +1,302 @@
+name: "Security Analysis"
+
+on:
+  push:
+    branches:
+      - develop
+      - master
+    paths-ignore:
+      - '*.md'
+      - 'LICENSE'
+      - 'screenshots/**'
+  pull_request:
+    branches:
+      - develop
+      - master
+    paths-ignore:
+      - '*.md'
+      - 'LICENSE'
+  schedule:
+    # Her hafta pazartesi saat 02:00'de çalıştır
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+env:
+  NODE_DEFAULT_VERSION: 22
+
+jobs:
+  semgrep:
+    name: "Semgrep Static Analysis"
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
+
+      - name: "Run Semgrep with OWASP ruleset"
+        run: |
+          semgrep scan \
+            --config=auto \
+            --config=p/owasp-top-ten \
+            --config=p/security-audit \
+            --config=p/nodejs \
+            --config=p/typescript \
+            --config=p/expressjs \
+            --config=p/sql-injection \
+            --config=p/xss \
+            --sarif \
+            --output=semgrep-results.sarif \
+            --max-memory 8192 \
+            --timeout 300
+        continue-on-error: true
+
+      - name: "Upload Semgrep SARIF results"
+        uses: github/codeql-action/upload-sarif@48a3eb2db1e0c8cd795fe7f3aaa6f1ab1f6e0e91 #v3.28.1
+        with:
+          sarif_file: semgrep-results.sarif
+          category: semgrep
+        if: always()
+
+      - name: "Upload Semgrep results as artifact"
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b #v4.5.0
+        with:
+          name: semgrep-results
+          path: semgrep-results.sarif
+          retention-days: 30
+        if: always()
+
+  semgrep-json:
+    name: "Semgrep Analysis (JSON output)"
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
+
+      - name: "Run Semgrep with JSON output"
+        run: |
+          semgrep scan \
+            --config=auto \
+            --config=p/owasp-top-ten \
+            --config=p/security-audit \
+            --config=p/nodejs \
+            --config=p/typescript \
+            --config=p/expressjs \
+            --json \
+            --output=semgrep-results.json \
+            --max-memory 8192 \
+            --timeout 300
+        continue-on-error: true
+
+      - name: "Upload Semgrep JSON results"
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b #v4.5.0
+        with:
+          name: semgrep-results-json
+          path: semgrep-results.json
+          retention-days: 30
+        if: always()
+
+  syft-sbom:
+    name: "Syft SBOM Generation"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
+
+      - name: "Use Node.js ${{ env.NODE_DEFAULT_VERSION }}"
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af #v4.1.0
+        with:
+          node-version: ${{ env.NODE_DEFAULT_VERSION }}
+
+      - name: "Install dependencies"
+        run: |
+          npm install --ignore-scripts
+          cd frontend
+          npm install --ignore-scripts --legacy-peer-deps
+
+      - name: "Install Syft"
+        uses: anchore/sbom-action/download-syft@d94f46e13c6c62f59525ac9a1e147a99dc0b9bf5 #v0.17.0
+
+      - name: "Generate SBOM for backend (NPM)"
+        run: |
+          syft dir:. \
+            -o json=sbom-backend.json \
+            -o spdx-json=sbom-backend-spdx.json \
+            -o cyclonedx-json=sbom-backend-cyclonedx.json \
+            --exclude '**/node_modules/**' \
+            --exclude '**/frontend/**' \
+            --exclude '**/test/**' \
+            --exclude '**/cypress/**'
+
+      - name: "Generate SBOM for frontend"
+        run: |
+          syft dir:./frontend \
+            -o json=sbom-frontend.json \
+            -o spdx-json=sbom-frontend-spdx.json \
+            -o cyclonedx-json=sbom-frontend-cyclonedx.json \
+            --exclude '**/node_modules/**'
+
+      - name: "Generate SBOM for Docker image (if exists)"
+        run: |
+          if [ -f "Dockerfile" ]; then
+            docker build -t juice-shop:analysis . || true
+            if docker images | grep -q juice-shop; then
+              syft docker:juice-shop:analysis \
+                -o json=sbom-docker.json \
+                -o spdx-json=sbom-docker-spdx.json \
+                -o cyclonedx-json=sbom-docker-cyclonedx.json || true
+            fi
+          fi
+        continue-on-error: true
+
+      - name: "Upload SBOM artifacts"
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b #v4.5.0
+        with:
+          name: sbom-reports
+          path: |
+            sbom-*.json
+          retention-days: 90
+        if: always()
+
+  grype-vulnerability-scan:
+    name: "Grype Vulnerability Scanning"
+    runs-on: ubuntu-latest
+    needs: syft-sbom
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
+
+      - name: "Download SBOM artifacts"
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 #v4.1.8
+        with:
+          name: sbom-reports
+
+      - name: "Install Grype"
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: "Scan backend SBOM with Grype"
+        run: |
+          if [ -f "sbom-backend.json" ]; then
+            grype sbom:./sbom-backend.json \
+              -o sarif=grype-backend-results.sarif \
+              -o json=grype-backend-results.json \
+              --fail-on critical
+          fi
+        continue-on-error: true
+
+      - name: "Scan frontend SBOM with Grype"
+        run: |
+          if [ -f "sbom-frontend.json" ]; then
+            grype sbom:./sbom-frontend.json \
+              -o sarif=grype-frontend-results.sarif \
+              -o json=grype-frontend-results.json \
+              --fail-on critical
+          fi
+        continue-on-error: true
+
+      - name: "Upload Grype SARIF results"
+        uses: github/codeql-action/upload-sarif@48a3eb2db1e0c8cd795fe7f3aaa6f1ab1f6e0e91 #v3.28.1
+        with:
+          sarif_file: grype-backend-results.sarif
+          category: grype-backend
+        if: always() && hashFiles('grype-backend-results.sarif') != ''
+
+      - name: "Upload Grype artifacts"
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b #v4.5.0
+        with:
+          name: grype-vulnerability-reports
+          path: |
+            grype-*.json
+            grype-*.sarif
+          retention-days: 30
+        if: always()
+
+  security-report:
+    name: "Generate Security Summary"
+    runs-on: ubuntu-latest
+    needs: [semgrep, semgrep-json, syft-sbom, grype-vulnerability-scan]
+    if: always()
+    steps:
+      - name: "Check out Git repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
+
+      - name: "Download all artifacts"
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 #v4.1.8
+        with:
+          path: security-reports
+
+      - name: "Generate summary report"
+        run: |
+          echo "# Security Analysis Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Analysis Date: $(date +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## Semgrep Static Analysis" >> $GITHUB_STEP_SUMMARY
+          if [ -f "security-reports/semgrep-results-json/semgrep-results.json" ]; then
+            SEMGREP_FINDINGS=$(jq '.results | length' security-reports/semgrep-results-json/semgrep-results.json)
+            echo "- Total findings: $SEMGREP_FINDINGS" >> $GITHUB_STEP_SUMMARY
+            
+            CRITICAL=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' security-reports/semgrep-results-json/semgrep-results.json || echo "0")
+            WARNING=$(jq '[.results[] | select(.extra.severity == "WARNING")] | length' security-reports/semgrep-results-json/semgrep-results.json || echo "0")
+            INFO=$(jq '[.results[] | select(.extra.severity == "INFO")] | length' security-reports/semgrep-results-json/semgrep-results.json || echo "0")
+            
+            echo "  - Critical/Error: $CRITICAL" >> $GITHUB_STEP_SUMMARY
+            echo "  - Warning: $WARNING" >> $GITHUB_STEP_SUMMARY
+            echo "  - Info: $INFO" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Semgrep results not available" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## SBOM Generation (Syft)" >> $GITHUB_STEP_SUMMARY
+          if [ -d "security-reports/sbom-reports" ]; then
+            echo "✅ SBOM files generated successfully" >> $GITHUB_STEP_SUMMARY
+            ls -lh security-reports/sbom-reports/ >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ SBOM generation failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## Vulnerability Scanning (Grype)" >> $GITHUB_STEP_SUMMARY
+          if [ -f "security-reports/grype-vulnerability-reports/grype-backend-results.json" ]; then
+            TOTAL_VULNS=$(jq '.matches | length' security-reports/grype-vulnerability-reports/grype-backend-results.json)
+            echo "- Total vulnerabilities found: $TOTAL_VULNS" >> $GITHUB_STEP_SUMMARY
+            
+            CRITICAL_VULNS=$(jq '[.matches[] | select(.vulnerability.severity == "Critical")] | length' security-reports/grype-vulnerability-reports/grype-backend-results.json || echo "0")
+            HIGH_VULNS=$(jq '[.matches[] | select(.vulnerability.severity == "High")] | length' security-reports/grype-vulnerability-reports/grype-backend-results.json || echo "0")
+            MEDIUM_VULNS=$(jq '[.matches[] | select(.vulnerability.severity == "Medium")] | length' security-reports/grype-vulnerability-reports/grype-backend-results.json || echo "0")
+            
+            echo "  - Critical: $CRITICAL_VULNS" >> $GITHUB_STEP_SUMMARY
+            echo "  - High: $HIGH_VULNS" >> $GITHUB_STEP_SUMMARY
+            echo "  - Medium: $MEDIUM_VULNS" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Grype vulnerability scan results not available" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "All security reports have been uploaded as workflow artifacts and are available for download." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Generated by GitHub Actions Security Analysis Workflow*" >> $GITHUB_STEP_SUMMARY
+
+      - name: "Upload combined security report"
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b #v4.5.0
+        with:
+          name: security-analysis-complete
+          path: security-reports/
+          retention-days: 90
+        if: always()
